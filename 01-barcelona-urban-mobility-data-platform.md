@@ -1295,17 +1295,21 @@ Para tener trazabilidad de cuándo pasó cada registro por mi transformación Si
 
 No debo decir en una entrevista que ya hice algo que todavía no existe.
 
-Actualmente todavía me falta:
+Ya implementé después de esta primera fase:
 
-- una fuente principal realmente orientada a movilidad;
+- fuente Bicing orientada a movilidad;
+- snapshots históricos Bronze;
 - incremental loading;
 - watermark;
-- Delta MERGE/upsert;
+- Delta MERGE idempotente;
+- orquestación Copy → Notebook.
+
+Todavía me falta:
+
 - Silver enrichment entre distintas fuentes;
 - Gold;
 - modelo dimensional;
 - SQL analítico;
-- orquestación completa;
 - visualización final.
 
 Puedo explicar que forman parte de la arquitectura objetivo, pero debo separar claramente **implementado** de **planificado**.
@@ -1317,3 +1321,791 @@ Puedo explicar que forman parte de la arquitectura objetivo, pero debo separar c
 > Construí una ingesta en Microsoft Fabric desde la API CKAN de Open Data Barcelona hacia una capa Bronze en OneLake. Después utilicé un notebook PySpark para leer el JSON anidado, extraer y explotar result.records, normalizar nombres y tipos, añadir metadata y ejecutar controles automáticos de calidad. Finalmente persistí el resultado como una Delta table Silver y la volví a leer para validar schema y row count.
 
 Ese resumen no sustituye entender el código. El objetivo de estas notas es que pueda explicar qué ocurre debajo de cada frase.
+
+
+---
+
+# 15. Bicing histórico e incremental
+
+Después de la primera Silver de Bicing, dejé de guardar un único `bicing_snapshot.json` que se sobrescribía.
+
+Ahora cada ejecución del pipeline crea un snapshot independiente:
+
+~~~text
+Files/bronze/citybikes/bicing/history/
+└── year=2026/
+    └── month=10/
+        └── day=03/
+            ├── bicing_20261003_134326.json
+            └── bicing_20261003_134432.json
+~~~
+
+Esto me permite conservar cómo estaba la red de Bicing en distintos momentos.
+
+## Expresión de Fabric para la carpeta
+
+~~~text
+@concat(
+    'bronze/citybikes/bicing/history/year=',
+    formatDateTime(utcNow(),'yyyy'),
+    '/month=',
+    formatDateTime(utcNow(),'MM'),
+    '/day=',
+    formatDateTime(utcNow(),'dd')
+)
+~~~
+
+Esto no es Python ni SQL. Es el lenguaje de expresiones de Fabric Data Factory.
+
+- `@` indica que Fabric debe evaluar una expresión.
+- `concat()` une textos.
+- `utcNow()` devuelve la fecha/hora actual UTC.
+- `formatDateTime()` da formato a una fecha.
+
+El nombre del archivo se genera con:
+
+~~~text
+@concat(
+    'bicing_',
+    formatDateTime(utcNow(),'yyyyMMdd_HHmmss'),
+    '.json'
+)
+~~~
+
+Así cada ejecución crea un archivo distinto.
+
+## Cómo lo explicaría en entrevista
+
+> Al principio sobrescribía un único snapshot. Cambié el destino del pipeline para generar snapshots timestamped y particionados por año, mes y día. De esta forma Bronze conserva el histórico y puede utilizarse para replay e incremental processing.
+
+---
+
+# 16. Qué es incremental load
+
+Una carga incremental significa que no vuelvo a procesar todo el histórico cada vez.
+
+Sin incrementalidad:
+
+~~~text
+1000 snapshots históricos
++ 1 snapshot nuevo
+↓
+volver a leer 1001 snapshots
+~~~
+
+Con incrementalidad:
+
+~~~text
+último snapshot procesado
+↓
+detecto los posteriores
+↓
+leo únicamente lo nuevo
+~~~
+
+Eso reduce I/O, transformaciones Spark y coste de cómputo.
+
+---
+
+# 17. Obtener el watermark
+
+## Código
+
+~~~python
+table_exists = spark.catalog.tableExists(
+    HISTORY_TABLE
+)
+
+if table_exists:
+    watermark = (
+        spark.table(HISTORY_TABLE)
+        .agg(
+            spark_max(
+                "snapshot_ingested_at"
+            ).alias("watermark")
+        )
+        .first()["watermark"]
+    )
+else:
+    watermark = None
+~~~
+
+## Qué significa watermark
+
+El watermark es la referencia que me dice:
+
+> Hasta este momento ya procesé los datos.
+
+En mi proyecto uso:
+
+~~~text
+MAX(snapshot_ingested_at)
+~~~
+
+Si el máximo es:
+
+~~~text
+2026-10-03 14:34:00
+~~~
+
+solo me interesan snapshots posteriores.
+
+## Partes importantes
+
+~~~python
+spark.catalog.tableExists(HISTORY_TABLE)
+~~~
+
+Comprueba si la tabla existe.
+
+Esto permite que el mismo notebook funcione tanto para:
+
+~~~text
+bootstrap
+→ primera carga
+
+incremental
+→ cargas posteriores
+~~~
+
+~~~python
+.agg(spark_max("snapshot_ingested_at"))
+~~~
+
+Hace una agregación para obtener el timestamp máximo.
+
+~~~python
+.first()["watermark"]
+~~~
+
+Toma la primera fila del resultado y accede al campo llamado watermark.
+
+## Patrón reutilizable
+
+~~~text
+¿Existe target?
+↓
+NO → watermark = None → initial load
+SÍ → watermark = MAX(fecha_procesada) → incremental
+~~~
+
+---
+
+# 18. Listar Bronze sin leer todos los JSON
+
+## Código
+
+~~~python
+def list_files_recursive(path):
+    files = []
+
+    for item in notebookutils.fs.ls(path):
+        if item.isDir:
+            files.extend(
+                list_files_recursive(item.path)
+            )
+        else:
+            files.append(item.path)
+
+    return files
+~~~
+
+## Qué hago
+
+`notebookutils.fs.ls()` lista elementos del filesystem de Fabric.
+
+Mi Bronze está dentro de varias carpetas:
+
+~~~text
+history/year/month/day/files
+~~~
+
+Por eso necesito una función recursiva.
+
+Una función recursiva es una función que puede llamarse a sí misma.
+
+Si encuentra una carpeta:
+
+~~~python
+list_files_recursive(item.path)
+~~~
+
+entra dentro de esa carpeta.
+
+Si encuentra un archivo:
+
+~~~python
+files.append(item.path)
+~~~
+
+lo añade a la lista.
+
+## Idea importante
+
+Aquí todavía no estoy leyendo el contenido JSON.
+
+Estoy mirando metadata de archivos para decidir qué necesito procesar.
+
+Eso es mucho más barato que abrir y transformar todos los snapshots.
+
+---
+
+# 19. Detectar snapshots posteriores al watermark
+
+## Código
+
+~~~python
+snapshot_pattern = re.compile(
+    r"bicing_(\d{8}_\d{6})\.json$"
+)
+
+new_snapshot_files = []
+
+for file_path in all_snapshot_files:
+
+    match = snapshot_pattern.search(
+        file_path
+    )
+
+    if match:
+
+        snapshot_datetime = datetime.strptime(
+            match.group(1),
+            "%Y%m%d_%H%M%S"
+        )
+
+        if (
+            watermark is None
+            or snapshot_datetime > watermark
+        ):
+            new_snapshot_files.append(
+                file_path
+            )
+~~~
+
+## Regex
+
+~~~text
+bicing_(\d{8}_\d{6})\.json$
+~~~
+
+Busca nombres como:
+
+~~~text
+bicing_20261003_143400.json
+~~~
+
+y captura:
+
+~~~text
+20261003_143400
+~~~
+
+### \d{8}
+
+Ocho dígitos:
+
+~~~text
+20261003
+~~~
+
+### _
+
+Guion bajo literal.
+
+### \d{6}
+
+Seis dígitos:
+
+~~~text
+143400
+~~~
+
+### $
+
+Indica final del texto.
+
+## datetime.strptime
+
+~~~python
+datetime.strptime(
+    "20261003_143400",
+    "%Y%m%d_%H%M%S"
+)
+~~~
+
+convierte texto en un datetime que Python puede comparar.
+
+## Condición incremental
+
+~~~python
+if (
+    watermark is None
+    or snapshot_datetime > watermark
+):
+~~~
+
+Significa:
+
+~~~text
+si todavía no hay watermark
+→ procesar
+
+O
+
+si snapshot > watermark
+→ procesar
+~~~
+
+---
+
+# 20. El caso de 0 datos nuevos
+
+## Código
+
+~~~python
+if len(new_snapshot_files) == 0:
+    print(
+        "No new snapshots to process. "
+        "Silver history is already up to date."
+    )
+
+    notebookutils.notebook.exit(
+        "No new snapshots to process."
+    )
+~~~
+
+## Por qué es importante
+
+No recibir nuevos datos no es un error.
+
+Un pipeline bien diseñado debe poder hacer:
+
+~~~text
+0 datos nuevos
+↓
+terminar correctamente
+~~~
+
+y no:
+
+~~~text
+0 datos
+↓
+spark.read.json([])
+↓
+error
+~~~
+
+Esto también evita iniciar transformaciones innecesarias.
+
+---
+
+# 21. Leer solamente los archivos nuevos
+
+## Código
+
+~~~python
+incremental_raw_df = (
+    spark.read
+    .option("multiline", "true")
+    .json(new_snapshot_files)
+    .withColumn(
+        "source_file",
+        input_file_name()
+    )
+)
+~~~
+
+La diferencia clave es:
+
+~~~python
+.json(new_snapshot_files)
+~~~
+
+No leo `HISTORY_ROOT` completo.
+
+Leo solo la lista filtrada.
+
+Eso es lo que convierte el proceso en incremental de verdad.
+
+~~~python
+input_file_name()
+~~~
+
+añade la ruta física del archivo del que procede cada registro.
+
+La utilizo después para obtener el timestamp del snapshot.
+
+---
+
+# 22. Convertir network.stations en observaciones históricas
+
+## Código
+
+~~~python
+incremental_stations_df = (
+    incremental_raw_df
+    .select(
+        "source_file",
+        explode(
+            col("network.stations")
+        ).alias("station")
+    )
+    .withColumn(
+        "snapshot_text",
+        regexp_extract(
+            col("source_file"),
+            r"bicing_(\d{8}_\d{6})\.json$",
+            1
+        )
+    )
+    .withColumn(
+        "snapshot_ingested_at",
+        to_timestamp(
+            col("snapshot_text"),
+            "yyyyMMdd_HHmmss"
+        )
+    )
+    .select(
+        "source_file",
+        "snapshot_ingested_at",
+        "station.*"
+    )
+)
+~~~
+
+## Lo importante
+
+`explode()` convierte cada estación del array en una fila.
+
+`regexp_extract()` obtiene la fecha/hora del nombre del archivo.
+
+`to_timestamp()` la convierte en timestamp real.
+
+Así cada observación conoce cuándo la capturé.
+
+---
+
+# 23. Los tres tiempos del modelo
+
+Ahora conservo tres tiempos diferentes.
+
+## source_timestamp
+
+~~~text
+¿Cuándo dice CityBikes que se actualizó esa estación?
+~~~
+
+## snapshot_ingested_at
+
+~~~text
+¿Cuándo capturó mi pipeline ese estado?
+~~~
+
+## silver_processed_at
+
+~~~text
+¿Cuándo transformó Spark ese registro?
+~~~
+
+No debo confundirlos.
+
+La clave histórica correcta es:
+
+~~~text
+station_id + snapshot_ingested_at
+~~~
+
+porque puedo capturar dos veces una estación aunque CityBikes mantenga el mismo source_timestamp.
+
+---
+
+# 24. Data Quality incremental
+
+Antes del MERGE calculo:
+
+~~~text
+incremental_rows
+incremental_duplicates
+incremental_null_critical
+incremental_null_availability
+incremental_invalid_availability
+incremental_invalid_coordinates
+incremental_warnings
+~~~
+
+Después convierto las reglas críticas en `assert`.
+
+Ejemplo:
+
+~~~python
+assert incremental_duplicates == 0, \
+    "Duplicate incremental observations detected"
+~~~
+
+El bike breakdown sigue siendo warning:
+
+~~~python
+if incremental_warnings > 0:
+    print(
+        f"WARNING: {incremental_warnings} incremental records "
+        "have an inconsistent bike breakdown."
+    )
+~~~
+
+## Regla mental
+
+~~~text
+ERROR crítico
+→ no confío en Silver
+→ detener
+
+WARNING
+→ dato puede seguir siendo útil
+→ conservar + marcar
+~~~
+
+---
+
+# 25. Delta MERGE
+
+## Código conceptual
+
+~~~python
+target_delta.alias("target").merge(
+    incremental_silver_df.alias("source"),
+    """
+    target.station_id = source.station_id
+    AND target.snapshot_ingested_at =
+        source.snapshot_ingested_at
+    """
+).whenNotMatchedInsertAll().execute()
+~~~
+
+## Qué es target
+
+La tabla Silver que ya existe.
+
+## Qué es source
+
+El nuevo batch que quiero cargar.
+
+## Condición
+
+~~~text
+mismo station_id
+Y
+mismo snapshot_ingested_at
+~~~
+
+significa que es la misma observación histórica.
+
+## whenNotMatchedInsertAll
+
+Si no existe en target:
+
+~~~text
+INSERT
+~~~
+
+Si ya existe, no hago nada.
+
+No hago update porque quiero que los snapshots históricos sean inmutables.
+
+---
+
+# 26. Idempotencia
+
+Idempotencia significa:
+
+> Ejecutar el mismo proceso varias veces deja el mismo resultado final.
+
+Prueba que hice:
+
+~~~text
+Rows before MERGE: 1088
+Rows after MERGE: 1088
+Rows inserted: 0
+~~~
+
+Eso demuestra que volver a procesar el mismo batch no duplica filas.
+
+Después, cuando llegó un snapshot nuevo:
+
+~~~text
+Rows before MERGE: 1088
+Rows after MERGE: 1631
+Rows inserted: 543
+~~~
+
+Solo se insertó lo que no existía.
+
+## Cómo lo explicaría en entrevista
+
+> I use a Delta MERGE keyed by station_id and snapshot_ingested_at. Reprocessing the same Bronze snapshot does not create duplicate Silver observations, so the load is idempotent.
+
+---
+
+# 27. Por qué un snapshot tuvo 543 y otros 544 estaciones
+
+No debo asumir que la API siempre devuelve exactamente el mismo número de estaciones.
+
+Comprobé con un left anti join qué estación estaba presente en el snapshot anterior pero no en el nuevo.
+
+~~~python
+previous_stations.join(
+    latest_stations,
+    on="station_id",
+    how="left_anti"
+)
+~~~
+
+## Qué hace left_anti
+
+~~~text
+dame filas de A
+que NO tienen coincidencia en B
+~~~
+
+Lo utilicé como diagnóstico temporal, no como parte del pipeline final.
+
+La enseñanza importante es:
+
+~~~text
+No codificar reglas de calidad basadas en suposiciones no garantizadas por la fuente.
+~~~
+
+---
+
+# 28. Validación final y avance del watermark
+
+Después del MERGE vuelvo a leer la tabla.
+
+Compruebo:
+
+- número total de filas;
+- número de snapshots;
+- duplicados;
+- watermark anterior;
+- watermark nuevo.
+
+También valido:
+
+~~~python
+if watermark is not None and rows_inserted > 0:
+    assert new_watermark > watermark
+~~~
+
+Si inserté nuevos snapshots, el watermark debe avanzar.
+
+Este patrón sirve para comprobar que el incremental load realmente progresó.
+
+---
+
+# 29. Orquestación end-to-end
+
+Finalmente conecté el notebook al pipeline:
+
+~~~text
+cp_ingest_bicing_bronze
+        │
+        │ Success
+        ▼
+nb_process_bicing_history
+~~~
+
+Eso significa que ya no necesito:
+
+~~~text
+ejecutar Copy manualmente
+↓
+ir al notebook
+↓
+ejecutarlo manualmente
+~~~
+
+Ahora una ejecución del pipeline hace:
+
+~~~text
+API
+↓
+Bronze histórico
+↓
+Notebook incremental
+↓
+Data Quality
+↓
+Delta MERGE
+↓
+Silver histórica
+~~~
+
+La dependencia es por Success.
+
+Si el Copy falla, no quiero procesar Silver.
+
+---
+
+# 30. Problema de capacidad Spark que vi
+
+Durante una ejecución apareció:
+
+~~~text
+TooManyRequestsForCapacity
+HTTP 430
+Failed to create Livy session
+~~~
+
+No era un error de mi código.
+
+Fabric no podía iniciar otra sesión Spark porque la capacidad estaba ocupada.
+
+La solución fue liberar sesiones Spark activas y volver a ejecutar.
+
+Esto me recuerda distinguir:
+
+~~~text
+error de lógica/código
+vs
+error de infraestructura/capacidad
+~~~
+
+---
+
+# 31. Cómo resumir esta fase en entrevista
+
+> I changed the Bicing ingestion from a single overwritten file to immutable timestamped Bronze snapshots partitioned by date. I then built a PySpark notebook that supports bootstrap and incremental execution. It obtains a watermark from the historical Silver table, selects only newer Bronze files, validates the incremental batch and performs an idempotent Delta MERGE using station_id and snapshot_ingested_at. Finally, I orchestrated the Copy and Notebook activities in Fabric so Bronze-to-Silver runs automatically.
+
+---
+
+# 32. Estado real antes de Gold
+
+Ya tengo implementado:
+
+~~~text
+REST ingestion
+Bronze
+historical snapshots
+PySpark Silver
+Data Quality
+timestamp normalization
+watermark
+incremental load
+Delta MERGE
+idempotency
+no-new-data handling
+Copy → Notebook orchestration
+~~~
+
+Lo siguiente es:
+
+~~~text
+Gold
+↓
+modelo analítico
+↓
+SQL
+↓
+BI / dashboard
+~~~
