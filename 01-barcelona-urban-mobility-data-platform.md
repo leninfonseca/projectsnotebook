@@ -2079,7 +2079,7 @@ error de infraestructura/capacidad
 
 ---
 
-# 32. Estado real antes de Gold
+# 32. Estado real después de construir Gold
 
 Ya tengo implementado:
 
@@ -2096,16 +2096,854 @@ Delta MERGE
 idempotency
 no-new-data handling
 Copy → Notebook orchestration
+Gold star schema
+dim_station
+dim_date
+dim_time
+fact_bicing_availability
+Gold KPIs
+Gold referential integrity
+Gold analytical validation
 ~~~
 
 Lo siguiente es:
 
 ~~~text
-Gold
+SQL Analytics Endpoint
 ↓
-modelo analítico
+consultas analíticas
 ↓
-SQL
+Power BI
 ↓
-BI / dashboard
+documentación visual final
 ~~~
+
+---
+
+# 33. Qué es una fact table y por qué Gold tiene forma de estrella
+
+Silver contiene una observación histórica completa de cada estación.
+
+Eso significa que en cada snapshot se repiten tanto las medidas como la información descriptiva:
+
+~~~text
+station_id
+station_name
+latitude
+longitude
+snapshot_ingested_at
+free_bikes
+empty_slots
+ebikes
+normal_bikes
+station_capacity
+...
+~~~
+
+En Gold separo dos ideas.
+
+## Fact
+
+La **fact table** contiene lo que ocurrió y lo que puedo medir.
+
+En mi proyecto:
+
+~~~text
+gold_fact_bicing_availability
+~~~
+
+responde a:
+
+> ¿Qué disponibilidad tenía una estación en un snapshot concreto?
+
+Guarda medidas como:
+
+~~~text
+free_bikes
+empty_slots
+ebikes
+normal_bikes
+station_capacity
+bike_availability_pct
+dock_availability_pct
+ebike_share_pct
+~~~
+
+## Dimension
+
+Las dimensiones describen el contexto del hecho.
+
+~~~text
+gold_dim_station
+→ qué estación es
+
+gold_dim_date
+→ qué día es
+
+gold_dim_time
+→ qué hora/franja es
+~~~
+
+## Por qué se llama star schema
+
+La fact queda en el centro y las dimensiones alrededor:
+
+~~~text
+                    dim_station
+                         |
+                         |
+dim_date -------- fact_bicing -------- dim_time
+~~~
+
+Visualmente las relaciones salen desde el centro como las puntas de una estrella.
+
+## Cómo lo explicaría en entrevista
+
+> I modelled Gold as a star schema. The central fact stores historical Bicing availability observations, while station, date and time dimensions provide reusable descriptive context for SQL and BI analysis.
+
+---
+
+# 34. Configuración del notebook Gold
+
+## Código principal
+
+~~~python
+SILVER_HISTORY_TABLE = "silver_bicing_station_history"
+
+GOLD_DIM_STATION = "gold_dim_station"
+GOLD_DIM_DATE = "gold_dim_date"
+GOLD_DIM_TIME = "gold_dim_time"
+GOLD_FACT_AVAILABILITY = "gold_fact_bicing_availability"
+
+silver_history_df = spark.table(
+    SILVER_HISTORY_TABLE
+)
+~~~
+
+Uso constantes para que los nombres de tablas estén definidos en un solo sitio.
+
+Si cambio un nombre, no quiero buscar strings repetidos por todo el notebook.
+
+~~~python
+spark.table(...)
+~~~
+
+lee una tabla registrada del Lakehouse y devuelve un DataFrame.
+
+## Regla importante sobre sesiones Spark
+
+Las tablas Delta permanecen guardadas.
+
+Las variables Python no.
+
+Por eso, si Fabric reinicia la sesión:
+
+~~~text
+gold_fact_bicing_availability
+→ sigue existiendo como tabla
+
+GOLD_FACT_AVAILABILITY
+→ puede desaparecer de memoria
+~~~
+
+La solución correcta es ejecutar el notebook desde arriba para volver a crear imports, constantes y DataFrames.
+
+---
+
+# 35. Validar el grain de Silver antes de construir Gold
+
+## Código
+
+~~~python
+silver_rows = silver_history_df.count()
+
+silver_unique_grain = (
+    silver_history_df
+    .select(
+        "station_id",
+        "snapshot_ingested_at"
+    )
+    .distinct()
+    .count()
+)
+
+silver_duplicate_grain = (
+    silver_rows - silver_unique_grain
+)
+
+assert silver_duplicate_grain == 0,     "Silver historical grain is not unique"
+~~~
+
+Antes de modelar Gold vuelvo a comprobar la regla histórica:
+
+~~~text
+1 fila
+=
+1 station_id
++
+1 snapshot_ingested_at
+~~~
+
+Si Gold parte de una Silver incorrecta, el modelo analítico también será incorrecto.
+
+## Patrón reutilizable
+
+~~~text
+total rows
+-
+distinct business grain
+=
+duplicate rows
+~~~
+
+---
+
+# 36. Construir dim_station con Window y row_number
+
+## Código
+
+~~~python
+station_window = (
+    Window
+    .partitionBy("station_id")
+    .orderBy(
+        col("snapshot_ingested_at").desc()
+    )
+)
+
+gold_dim_station_df = (
+    silver_history_df
+    .withColumn(
+        "station_row_number",
+        row_number().over(station_window)
+    )
+    .filter(
+        col("station_row_number") == 1
+    )
+)
+~~~
+
+Silver puede contener muchas observaciones de la misma estación.
+
+La dimensión necesita una sola fila por estación.
+
+## partitionBy
+
+~~~python
+Window.partitionBy("station_id")
+~~~
+
+crea conceptualmente un grupo independiente para cada estación.
+
+## orderBy DESC
+
+~~~python
+.orderBy(
+    col("snapshot_ingested_at").desc()
+)
+~~~
+
+ordena cada grupo del snapshot más nuevo al más antiguo.
+
+## row_number
+
+~~~python
+row_number().over(station_window)
+~~~
+
+numera las filas dentro de cada grupo:
+
+~~~text
+station A
+snapshot nuevo     1
+snapshot anterior  2
+snapshot anterior  3
+~~~
+
+Luego filtro:
+
+~~~python
+col("station_row_number") == 1
+~~~
+
+y me quedo con el estado descriptivo más reciente conocido.
+
+## Decisión de modelado
+
+No estoy implementando SCD Type 2 aquí.
+
+Mi fact conserva el histórico de disponibilidad.
+
+Mi dimensión de estación representa la versión descriptiva más reciente.
+
+---
+
+# 37. Surrogate key con xxhash64
+
+## Código
+
+~~~python
+xxhash64(
+    col("station_id")
+).alias("station_key")
+~~~
+
+`station_id` pertenece al sistema fuente.
+
+`station_key` pertenece a mi modelo analítico.
+
+Eso permite separar:
+
+~~~text
+business / natural key
+→ station_id
+
+surrogate analytical key
+→ station_key
+~~~
+
+## Por qué no uso un número incremental
+
+Si generara IDs basados en el orden de las filas, una reconstrucción podría asignar claves diferentes.
+
+Con:
+
+~~~text
+xxhash64(station_id)
+~~~
+
+la misma estación produce la misma clave de forma determinista.
+
+Eso encaja bien con mi estrategia de reconstruir Gold.
+
+## Cómo lo explicaría en entrevista
+
+> I preserve the source station_id as the natural key and generate a deterministic station_key with xxhash64 so the Gold model can be rebuilt without changing dimension keys.
+
+---
+
+# 38. Construir dim_date como calendario continuo
+
+Primero obtengo los límites:
+
+~~~python
+date_bounds = (
+    silver_history_df
+    .select(
+        spark_min(
+            to_date(col("snapshot_ingested_at"))
+        ).alias("min_date"),
+        spark_max(
+            to_date(col("snapshot_ingested_at"))
+        ).alias("max_date")
+    )
+    .first()
+)
+~~~
+
+Después genero todas las fechas entre ambos extremos:
+
+~~~python
+sequence(
+    lit(min_date),
+    lit(max_date),
+    expr("INTERVAL 1 DAY")
+)
+~~~
+
+`sequence()` crea un array de fechas.
+
+`explode()` convierte ese array en una fila por fecha.
+
+## Por qué no hago solo distinct sobre Silver
+
+Si un día no tuviera snapshots, desaparecería del calendario.
+
+Una dimensión fecha debería poder representar el intervalo completo.
+
+## date_key
+
+~~~python
+date_format(
+    col("full_date"),
+    "yyyyMMdd"
+).cast("int")
+~~~
+
+convierte:
+
+~~~text
+2026-10-04
+~~~
+
+en:
+
+~~~text
+20261004
+~~~
+
+## Atributos reutilizables
+
+La dimensión calcula una vez:
+
+~~~text
+year
+quarter
+month
+month_name
+day
+week_of_year
+day_of_week
+day_name
+is_weekend
+~~~
+
+Así no tengo que recalcularlos para cada fila de la fact.
+
+---
+
+# 39. Construir dim_time
+
+Extraigo:
+
+~~~python
+hour(
+    col("snapshot_ingested_at")
+)
+
+minute(
+    col("snapshot_ingested_at")
+)
+~~~
+
+y me quedo con combinaciones distintas.
+
+## time_key
+
+~~~python
+hour * 100 + minute
+~~~
+
+Ejemplos:
+
+~~~text
+08:30 → 830
+13:43 → 1343
+18:05 → 1805
+~~~
+
+## time_label
+
+Uso:
+
+~~~python
+concat(
+    lpad(col("hour").cast("string"), 2, "0"),
+    lit(":"),
+    lpad(col("minute").cast("string"), 2, "0")
+)
+~~~
+
+`lpad` rellena con ceros a la izquierda.
+
+~~~text
+8 → "08"
+5 → "05"
+~~~
+
+## day_period
+
+~~~text
+00-05 → Night
+06-11 → Morning
+12-17 → Afternoon
+18-23 → Evening
+~~~
+
+Esto prepara una dimensión útil para BI sin repetir esa lógica en cada consulta.
+
+---
+
+# 40. Construir la fact de disponibilidad
+
+La fact parte de Silver y se une a la dimensión de estación para recuperar `station_key`.
+
+~~~python
+silver_history_df.join(
+    gold_dim_station_df.select(
+        "station_key",
+        "station_id"
+    ),
+    on="station_id",
+    how="inner"
+)
+~~~
+
+`station_id` funciona como puente entre Silver y la dimensión.
+
+Después genero:
+
+~~~text
+date_key
+time_key
+~~~
+
+a partir de `snapshot_ingested_at`.
+
+## Grain de la fact
+
+~~~text
+1 fila
+=
+1 estación
++
+1 snapshot capturado
+~~~
+
+La clave lógica sigue siendo:
+
+~~~text
+station_key + snapshot_ingested_at
+~~~
+
+## Medidas principales
+
+~~~text
+free_bikes
+empty_slots
+ebikes
+normal_bikes
+station_capacity
+~~~
+
+La fact no existe para describir la estación.
+
+Existe para almacenar el estado medible de la estación en cada momento observado.
+
+---
+
+# 41. KPIs Gold y divisiones seguras
+
+## bike_availability_pct
+
+~~~text
+free_bikes
+────────────── × 100
+station_capacity
+~~~
+
+Mide qué porcentaje de la capacidad corresponde a bicicletas disponibles.
+
+## dock_availability_pct
+
+~~~text
+empty_slots
+────────────── × 100
+station_capacity
+~~~
+
+Mide qué porcentaje de la estación está disponible para devolver bicicletas.
+
+## ebike_share_pct
+
+~~~text
+ebikes
+────────── × 100
+free_bikes
+~~~
+
+Mide qué parte de las bicicletas disponibles son eléctricas.
+
+## Por qué uso when
+
+~~~python
+when(
+    col("station_capacity") > 0,
+    ...
+)
+~~~
+
+No quiero dividir entre cero.
+
+Además, dejar NULL cuando el denominador no permite calcular el porcentaje es semánticamente mejor que inventar 0%.
+
+~~~text
+0%
+→ el KPI fue calculable y dio cero
+
+NULL
+→ no era calculable
+~~~
+
+Esta diferencia es importante en analítica.
+
+---
+
+# 42. Quality checks de Gold
+
+Antes de persistir Gold valido varias reglas.
+
+## 1. Row reconciliation
+
+~~~python
+assert fact_rows == silver_rows
+~~~
+
+Quiero asegurarme de que transformar Silver a la fact no haya perdido ni multiplicado observaciones.
+
+## 2. Grain único
+
+~~~text
+station_key + snapshot_ingested_at
+~~~
+
+debe seguir siendo único.
+
+## 3. station_key único en la dimensión
+
+Una dimensión no puede tener dos filas con la misma clave si espero una relación many-to-one desde la fact.
+
+## 4. Foreign keys no nulas
+
+Compruebo:
+
+~~~text
+station_key
+date_key
+time_key
+~~~
+
+## 5. Referential integrity
+
+Uso left anti join.
+
+~~~python
+fact_keys.join(
+    dimension_keys,
+    on="station_key",
+    how="left_anti"
+)
+~~~
+
+Eso devuelve claves que existen en la fact pero no en la dimensión.
+
+El resultado debe ser:
+
+~~~text
+0 orphan keys
+~~~
+
+Repito el patrón para estación, fecha y hora.
+
+## 6. KPIs entre 0 y 100
+
+Las medidas porcentuales no nulas deben respetar:
+
+~~~text
+0 <= KPI <= 100
+~~~
+
+## Cómo lo explicaría en entrevista
+
+> Before writing Gold I validate row reconciliation, fact grain uniqueness, dimension-key uniqueness, non-null foreign keys, referential integrity with left anti joins and KPI ranges.
+
+---
+
+# 43. Persistir Gold y por qué uso overwrite
+
+Escribo cuatro tablas Delta:
+
+~~~text
+gold_dim_station
+gold_dim_date
+gold_dim_time
+gold_fact_bicing_availability
+~~~
+
+El patrón es:
+
+~~~python
+df.write
+.format("delta")
+.mode("overwrite")
+.option("overwriteSchema", "true")
+.saveAsTable(...)
+~~~
+
+## Por qué Gold se sobrescribe pero Silver es incremental
+
+Silver es mi histórico confiable y crece incrementalmente.
+
+Gold es una representación analítica derivada.
+
+Actualmente hago:
+
+~~~text
+Silver completa y validada
+↓
+recalcular dimensiones
+↓
+recalcular fact
+↓
+overwrite Gold
+~~~
+
+Eso tiene sentido porque el volumen todavía es pequeño.
+
+También me permite cambiar una fórmula de KPI y reconstruir todo Gold con una única definición coherente.
+
+Si tuviera cientos de millones o miles de millones de filas, podría plantear Gold incremental.
+
+---
+
+# 44. Validación analítica del star schema
+
+Después de escribir Gold, vuelvo a leer las tablas.
+
+~~~python
+gold_fact_df = spark.table(
+    GOLD_FACT_AVAILABILITY
+)
+~~~
+
+Luego uno:
+
+~~~text
+fact
++ dim_station
++ dim_date
++ dim_time
+~~~
+
+y comparo:
+
+~~~text
+Fact rows
+Joined analytical rows
+~~~
+
+No quiero que un join de dimensiones multiplique accidentalmente las observaciones.
+
+## Primera pregunta analítica
+
+Agrupo por:
+
+~~~text
+day_period
+~~~
+
+y calculo:
+
+~~~text
+observations
+avg_free_bikes
+avg_bike_availability_pct
+avg_dock_availability_pct
+~~~
+
+Ya no estoy limpiando JSON.
+
+Estoy usando el modelo para responder preguntas.
+
+## Segunda pregunta analítica
+
+Filtro estaciones online y agrupo por estación para ordenar:
+
+~~~text
+avg_bike_availability_pct ASC
+~~~
+
+Eso permite identificar estaciones con menor disponibilidad media durante las observaciones.
+
+---
+
+# 45. Por qué no uní todavía Bicing con district_context
+
+Bicing tiene:
+
+~~~text
+station_id
+station_name
+latitude
+longitude
+~~~
+
+El dataset contextual tiene:
+
+~~~text
+district_code
+neighborhood_code
+district_name
+neighborhood_name
+...
+~~~
+
+No existe actualmente una clave fiable como:
+
+~~~text
+station_id ↔ district_code
+~~~
+
+Tampoco tengo en ese dataset contextual una geometría lista para hacer un spatial join.
+
+Por eso no debo inventar una relación por nombre.
+
+La decisión correcta es:
+
+~~~text
+no join artificial
+↓
+mantener contexto separado
+↓
+añadir spatial enrichment real más adelante si aporta valor
+~~~
+
+Esto también es una decisión de ingeniería defendible.
+
+---
+
+# 46. Estado actual del proyecto después de Gold
+
+Mi arquitectura implementada ahora es:
+
+~~~text
+Public REST APIs
+↓
+Fabric Data Factory
+↓
+Bronze / OneLake
+↓
+historical timestamped snapshots
+↓
+PySpark
+↓
+Silver Delta
+↓
+watermark + incremental processing
+↓
+Delta MERGE
+↓
+Gold star schema
+├── dim_station
+├── dim_date
+├── dim_time
+└── fact_bicing_availability
+↓
+analytical validation
+~~~
+
+Lo siguiente es:
+
+~~~text
+SQL Analytics Endpoint
+↓
+SQL sobre Gold
+↓
+Power BI
+↓
+documentación visual final
+~~~
+
+## Resumen de entrevista de esta fase
+
+> I built a Gold analytical layer on top of the historical Silver Bicing table. I modelled it as a star schema with station, date and time dimensions around an availability fact table. I use a deterministic station surrogate key, calculate business-facing availability KPIs, validate referential integrity and row reconciliation, and persist the model as Delta tables. For the current volume, Gold is rebuilt from Silver so the analytical layer remains simple and consistent.
