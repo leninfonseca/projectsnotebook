@@ -2932,14 +2932,14 @@ Gold star schema
 analytical validation
 ~~~
 
+Ya tengo también implementada la capa SQL Analytics Endpoint sobre Gold.
+
 Lo siguiente es:
 
 ~~~text
-SQL Analytics Endpoint
-↓
-SQL sobre Gold
-↓
 Power BI
+↓
+dashboard analítico
 ↓
 documentación visual final
 ~~~
@@ -2947,3 +2947,717 @@ documentación visual final
 ## Resumen de entrevista de esta fase
 
 > I built a Gold analytical layer on top of the historical Silver Bicing table. I modelled it as a star schema with station, date and time dimensions around an availability fact table. I use a deterministic station surrogate key, calculate business-facing availability KPIs, validate referential integrity and row reconciliation, and persist the model as Delta tables. For the current volume, Gold is rebuilt from Silver so the analytical layer remains simple and consistent.
+
+---
+
+# 47. SQL Analytics Endpoint: para qué lo uso
+
+Después de construir Gold con Spark, no necesito mover las tablas a otra base de datos para consultarlas con SQL.
+
+Las tablas Delta Gold aparecen en el SQL Analytics Endpoint del Lakehouse:
+
+~~~text
+gold_dim_station
+gold_dim_date
+gold_dim_time
+gold_fact_bicing_availability
+~~~
+
+Esto me permite consumir el mismo modelo con T-SQL.
+
+La arquitectura queda:
+
+~~~text
+PySpark
+↓
+Gold Delta
+↓
+SQL Analytics Endpoint
+↓
+T-SQL
+↓
+Power BI
+~~~
+
+## Idea importante
+
+Spark y SQL no están trabajando sobre dos copias independientes de Gold.
+
+Estoy exponiendo las mismas tablas Delta mediante otra interfaz de consumo.
+
+## Cómo lo explicaría en entrevista
+
+> I build and validate the Gold layer with PySpark and then expose the same Delta tables through the Fabric SQL Analytics Endpoint for T-SQL analysis and BI consumption.
+
+---
+
+# 48. SELECT, aliases y TOP
+
+Mi primera consulta SQL importante fue:
+
+~~~sql
+SELECT TOP 50
+    s.station_name,
+    d.full_date,
+    t.time_label,
+    t.day_period,
+    f.free_bikes,
+    f.empty_slots,
+    f.bike_availability_pct
+
+FROM gold_fact_bicing_availability AS f
+...
+~~~
+
+## SELECT
+
+Elige las columnas que quiero devolver.
+
+~~~sql
+SELECT station_name
+~~~
+
+es conceptualmente parecido a:
+
+~~~python
+df.select("station_name")
+~~~
+
+en PySpark.
+
+## TOP
+
+~~~sql
+TOP 50
+~~~
+
+limita el resultado a 50 filas.
+
+Lo uso para inspección rápida sin devolver toda la tabla.
+
+## Alias de tabla
+
+~~~sql
+gold_fact_bicing_availability AS f
+gold_dim_station AS s
+gold_dim_date AS d
+gold_dim_time AS t
+~~~
+
+Esto me permite escribir:
+
+~~~sql
+f.free_bikes
+s.station_name
+~~~
+
+en vez de repetir el nombre completo de cada tabla.
+
+---
+
+# 49. JOIN del star schema en SQL
+
+La consulta principal reconstruye el contexto analítico:
+
+~~~sql
+FROM gold_fact_bicing_availability AS f
+
+LEFT JOIN gold_dim_station AS s
+    ON f.station_key = s.station_key
+
+LEFT JOIN gold_dim_date AS d
+    ON f.date_key = d.date_key
+
+LEFT JOIN gold_dim_time AS t
+    ON f.time_key = t.time_key
+~~~
+
+La fact guarda claves y medidas.
+
+Las dimensiones convierten esas claves en contexto legible:
+
+~~~text
+station_key
+→ station_name / latitude / longitude
+
+date_key
+→ full_date / day_name / is_weekend
+
+time_key
+→ time_label / day_period
+~~~
+
+## Por qué LEFT JOIN
+
+Con LEFT JOIN conservo todas las filas de la fact aunque una dimensión no encuentre coincidencia.
+
+Si eso ocurriera:
+
+~~~text
+fact row
+→ permanece
+
+dimension columns
+→ NULL
+~~~
+
+Con INNER JOIN esa fila desaparecería.
+
+En mi modelo no debería haber huérfanos porque ya validé referential integrity en Gold, pero LEFT JOIN hace que un problema sea más visible en vez de ocultarlo mediante pérdida de filas.
+
+---
+
+# 50. ORDER BY, ASC y DESC
+
+En la preview uso:
+
+~~~sql
+ORDER BY
+    d.full_date DESC,
+    t.time_key DESC,
+    s.station_name;
+~~~
+
+Esto significa:
+
+~~~text
+fecha más nueva primero
+↓
+hora más nueva primero
+↓
+estaciones por nombre ascendente
+~~~
+
+## ASC
+
+Orden ascendente.
+
+Es el valor por defecto.
+
+~~~sql
+ORDER BY station_name
+~~~
+
+equivale a:
+
+~~~sql
+ORDER BY station_name ASC
+~~~
+
+## DESC
+
+Orden descendente.
+
+~~~sql
+ORDER BY full_date DESC
+~~~
+
+pone primero las fechas más recientes.
+
+---
+
+# 51. GROUP BY y agregaciones
+
+Para encontrar estaciones con peor disponibilidad media uso:
+
+~~~sql
+SELECT TOP 20
+    s.station_name,
+    COUNT(*) AS observations,
+    AVG(f.bike_availability_pct)
+        AS avg_bike_availability_pct
+
+FROM gold_fact_bicing_availability AS f
+
+LEFT JOIN gold_dim_station AS s
+    ON f.station_key = s.station_key
+
+WHERE f.is_online = 1
+
+GROUP BY
+    s.station_name
+
+ORDER BY
+    avg_bike_availability_pct ASC;
+~~~
+
+## GROUP BY
+
+Agrupa varias filas que pertenecen a la misma entidad.
+
+Ejemplo:
+
+~~~text
+Station A  10%
+Station A  30%
+Station A  20%
+~~~
+
+con:
+
+~~~sql
+GROUP BY station_name
+~~~
+
+se convierte conceptualmente en un grupo:
+
+~~~text
+Station A
+→ 3 observaciones
+~~~
+
+Después puedo aplicar agregaciones al grupo.
+
+## COUNT(*)
+
+~~~sql
+COUNT(*)
+~~~
+
+cuenta las filas del grupo.
+
+En mi caso:
+
+~~~text
+observations
+~~~
+
+me dice cuántos snapshots válidos estoy usando para calcular la media de esa estación.
+
+## AVG
+
+~~~sql
+AVG(f.bike_availability_pct)
+~~~
+
+calcula el promedio del KPI dentro de cada grupo.
+
+---
+
+# 52. WHERE: filtrar antes de agrupar
+
+Uso:
+
+~~~sql
+WHERE f.is_online = 1
+~~~
+
+para excluir observaciones offline antes de calcular el promedio.
+
+Conceptualmente:
+
+~~~text
+todas las filas
+↓
+WHERE
+↓
+solo online
+↓
+GROUP BY station
+↓
+AVG
+~~~
+
+Esto evita mezclar estados offline con la disponibilidad normal de la estación.
+
+## Equivalencia mental con PySpark
+
+SQL:
+
+~~~sql
+WHERE f.is_online = 1
+~~~
+
+PySpark:
+
+~~~python
+.filter(
+    col("is_online") == True
+)
+~~~
+
+---
+
+# 53. HAVING: filtrar después de agrupar
+
+Aunque la consulta de HAVING fue principalmente de aprendizaje y no la guardé en el repo profesional, el concepto sí debo dominar.
+
+Ejemplo:
+
+~~~sql
+GROUP BY
+    s.station_name
+
+HAVING COUNT(*) >= 5
+~~~
+
+Significa:
+
+> Agrupa primero por estación y después conserva solo estaciones con al menos 5 observaciones.
+
+No puedo poner:
+
+~~~sql
+WHERE COUNT(*) >= 5
+~~~
+
+porque WHERE ocurre antes del GROUP BY.
+
+## Orden conceptual SQL que debo recordar
+
+~~~text
+FROM / JOIN
+↓
+WHERE
+↓
+GROUP BY
+↓
+HAVING
+↓
+SELECT
+↓
+ORDER BY
+~~~
+
+No es necesariamente el orden físico interno exacto del motor, pero es una buena regla mental para entender por qué una expresión está disponible o no en cada fase.
+
+---
+
+# 54. Disponibilidad por franja del día
+
+Consulta:
+
+~~~sql
+SELECT
+    t.day_period,
+    COUNT(*) AS observations,
+    AVG(f.free_bikes) AS avg_free_bikes,
+    AVG(f.bike_availability_pct)
+        AS avg_bike_availability_pct,
+    AVG(f.dock_availability_pct)
+        AS avg_dock_availability_pct
+
+FROM gold_fact_bicing_availability AS f
+
+LEFT JOIN gold_dim_time AS t
+    ON f.time_key = t.time_key
+
+GROUP BY
+    t.day_period;
+~~~
+
+Aquí aprovecho una ventaja del modelo dimensional.
+
+No recalculo:
+
+~~~text
+si hora < 6 → Night
+si hora < 12 → Morning
+...
+~~~
+
+en cada consulta.
+
+Ya lo resolví una vez en:
+
+~~~text
+gold_dim_time.day_period
+~~~
+
+Eso mantiene la lógica analítica centralizada.
+
+---
+
+# 55. Weekday vs weekend
+
+Consulta:
+
+~~~sql
+SELECT
+    d.is_weekend,
+    COUNT(*) AS observations,
+    AVG(f.free_bikes) AS avg_free_bikes,
+    AVG(f.empty_slots) AS avg_empty_slots,
+    AVG(f.bike_availability_pct)
+        AS avg_bike_availability_pct,
+    AVG(f.dock_availability_pct)
+        AS avg_dock_availability_pct
+
+FROM gold_fact_bicing_availability AS f
+
+LEFT JOIN gold_dim_date AS d
+    ON f.date_key = d.date_key
+
+GROUP BY
+    d.is_weekend;
+~~~
+
+Otra vez reutilizo un atributo ya creado en la dimensión:
+
+~~~text
+dim_date.is_weekend
+~~~
+
+La fact no necesita guardar repetidamente si cada fecha era fin de semana.
+
+---
+
+# 56. Disponibilidad por día de la semana
+
+Consulta:
+
+~~~sql
+SELECT
+    d.day_name,
+    d.day_of_week,
+    COUNT(*) AS observations,
+    AVG(f.bike_availability_pct)
+        AS avg_bike_availability_pct,
+    AVG(f.dock_availability_pct)
+        AS avg_dock_availability_pct
+
+FROM gold_fact_bicing_availability AS f
+
+LEFT JOIN gold_dim_date AS d
+    ON f.date_key = d.date_key
+
+GROUP BY
+    d.day_name,
+    d.day_of_week
+
+ORDER BY
+    d.day_of_week;
+~~~
+
+## Por qué agrupo también por day_of_week
+
+Quiero mostrar:
+
+~~~text
+Monday
+Tuesday
+Wednesday
+...
+Sunday
+~~~
+
+y no:
+
+~~~text
+Friday
+Monday
+Saturday
+...
+~~~
+
+ordenado alfabéticamente.
+
+Por eso la dimensión fecha contiene un número de orden reutilizable.
+
+---
+
+# 57. CASE WHEN: IF / ELSE de SQL
+
+En la query preparada para Power BI añadí:
+
+~~~sql
+CASE
+    WHEN f.is_online = 0
+        THEN 'Offline'
+
+    WHEN f.station_capacity IS NULL
+         OR f.station_capacity = 0
+        THEN 'No capacity'
+
+    WHEN f.bike_availability_pct < 20
+        THEN 'Low bikes'
+
+    WHEN f.dock_availability_pct < 20
+        THEN 'Low docks'
+
+    ELSE 'Balanced'
+END AS availability_status
+~~~
+
+CASE evalúa condiciones en orden.
+
+La primera condición que se cumple gana.
+
+## Por qué el orden importa
+
+Si una estación está offline y además tiene disponibilidad baja:
+
+~~~text
+is_online = 0
+bike_availability_pct = 0
+~~~
+
+quiero:
+
+~~~text
+Offline
+~~~
+
+y no:
+
+~~~text
+Low bikes
+~~~
+
+Por eso compruebo offline primero.
+
+## Clasificaciones actuales
+
+~~~text
+Offline
+No capacity
+Low bikes
+Low docks
+Balanced
+~~~
+
+El umbral del 20% es una regla analítica del serving/dashboard.
+
+No es una corrección del dato fuente y no pertenece a la lógica de calidad Silver.
+
+---
+
+# 58. Serving query para Power BI
+
+La consulta:
+
+~~~text
+06_powerbi_serving_query.sql
+~~~
+
+junta:
+
+~~~text
+dim_station
++
+dim_date
++
+dim_time
++
+fact_bicing_availability
+~~~
+
+y devuelve una tabla plana con:
+
+~~~text
+station_name
+latitude
+longitude
+full_date
+day_name
+is_weekend
+time_label
+day_period
+snapshot_ingested_at
+free_bikes
+empty_slots
+ebikes
+normal_bikes
+station_capacity
+bike_availability_pct
+dock_availability_pct
+ebike_share_pct
+is_online
+availability_status
+~~~
+
+## Por qué tengo star schema si luego hago una tabla plana
+
+El modelo físico sigue siendo dimensional.
+
+La query plana es una vista de consumo.
+
+~~~text
+modelo Gold bien diseñado
+↓
+query serving
+↓
+consumidor sencillo
+~~~
+
+No son ideas contradictorias.
+
+La estrella facilita modelado y reutilización.
+
+La query plana facilita algunos escenarios de BI y presentación.
+
+---
+
+# 59. Mis seis queries SQL del proyecto
+
+En el repo profesional guardé:
+
+~~~text
+01_gold_star_schema_preview.sql
+02_low_availability_stations.sql
+03_availability_by_day_period.sql
+04_weekday_vs_weekend.sql
+05_availability_by_day.sql
+06_powerbi_serving_query.sql
+~~~
+
+Cada una tiene una intención.
+
+~~~text
+01 → validar/mostrar star schema
+02 → ranking de estaciones
+03 → análisis por franja
+04 → weekday vs weekend
+05 → análisis por día
+06 → serving para Power BI
+~~~
+
+La consulta de HAVING fue de práctica y no necesito subirla al repo principal.
+
+---
+
+# 60. Estado del proyecto después de SQL
+
+Ahora tengo implementado:
+
+~~~text
+REST ingestion
+↓
+Bronze
+↓
+historical snapshots
+↓
+Silver incremental
+↓
+watermark
+↓
+Delta MERGE
+↓
+Gold star schema
+↓
+Gold quality checks
+↓
+SQL Analytics Endpoint
+↓
+T-SQL joins
+↓
+aggregations
+↓
+serving query
+~~~
+
+Lo siguiente es:
+
+~~~text
+Power BI
+↓
+dashboard
+↓
+evidencia final
+↓
+arquitectura/documentación visual
+~~~
+
+## Resumen de entrevista de esta fase
+
+> I expose the Gold Delta tables through the Fabric SQL Analytics Endpoint and use T-SQL to query the star schema. I built analytical queries for station availability, time-of-day and weekday/weekend comparisons, and a serving query that joins the dimensions with the fact and derives a business-facing availability status using CASE logic. This SQL layer is the serving surface for the Power BI phase.
