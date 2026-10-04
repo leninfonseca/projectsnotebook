@@ -3661,3 +3661,672 @@ arquitectura/documentación visual
 ## Resumen de entrevista de esta fase
 
 > I expose the Gold Delta tables through the Fabric SQL Analytics Endpoint and use T-SQL to query the star schema. I built analytical queries for station availability, time-of-day and weekday/weekend comparisons, and a serving query that joins the dimensions with the fact and derives a business-facing availability status using CASE logic. This SQL layer is the serving surface for the Power BI phase.
+
+---
+
+# 61. Semantic model de Power BI
+
+En Power BI no consumí una tabla plana como modelo principal.
+
+Usé directamente las cuatro tablas Gold:
+
+~~~text
+gold_dim_station
+gold_dim_date
+gold_dim_time
+gold_fact_bicing_availability
+~~~
+
+Eso mantiene el star schema también dentro de la capa BI.
+
+## Relaciones
+
+Creé tres relaciones:
+
+~~~text
+gold_dim_station[station_key]
+        1
+        |
+        *
+gold_fact_bicing_availability[station_key]
+~~~
+
+~~~text
+gold_dim_date[date_key]
+        1
+        |
+        *
+gold_fact_bicing_availability[date_key]
+~~~
+
+~~~text
+gold_dim_time[time_key]
+        1
+        |
+        *
+gold_fact_bicing_availability[time_key]
+~~~
+
+La dimensión está en el lado 1.
+
+La fact está en el lado * porque una estación, una fecha o una hora pueden aparecer en muchas observaciones históricas.
+
+## Cross-filter direction
+
+Utilicé:
+
+~~~text
+Single
+dimension → fact
+~~~
+
+No necesito filtro bidireccional.
+
+Quiero que una selección de estación, fecha o franja temporal filtre la fact de forma predecible.
+
+## Cómo lo explicaría en entrevista
+
+> I reused the Gold star schema directly in the Power BI semantic model. Each dimension has a one-to-many relationship to the fact and filters flow in a single direction from dimensions to the fact.
+
+---
+
+# 62. Qué es una medida DAX en este proyecto
+
+Las medidas DAX no son columnas nuevas guardadas fila por fila.
+
+Son cálculos que Power BI evalúa en tiempo de consulta según el contexto del informe.
+
+Creé:
+
+~~~text
+Total Observations
+Bike Availability %
+Dock Availability %
+E-bike Share %
+Online Observations
+Online Observation %
+~~~
+
+Ejemplo:
+
+~~~DAX
+Total Observations =
+COUNTROWS('gold_fact_bicing_availability')
+~~~
+
+Esto cuenta filas de la fact, pero el resultado cambia según los filtros activos.
+
+Sin filtros:
+
+~~~text
+todas las observaciones
+~~~
+
+Si selecciono una estación:
+
+~~~text
+solo observaciones de esa estación
+~~~
+
+Si además selecciono Afternoon:
+
+~~~text
+solo observaciones de esa estación
+durante Afternoon
+~~~
+
+La medida es la misma.
+
+Lo que cambia es el filter context.
+
+---
+
+# 63. Filter context: la idea más importante de DAX que aprendí
+
+Una medida DAX se recalcula usando el conjunto de filas visibles en ese momento.
+
+Ejemplo:
+
+~~~text
+dim_station slicer
+      ↓
+filtra station_key
+      ↓
+relación 1:*
+      ↓
+fact
+      ↓
+DAX
+      ↓
+nuevo resultado
+~~~
+
+Eso explica por qué una card puede mostrar:
+
+~~~text
+Bike Availability = 36%
+~~~
+
+y después de seleccionar una estación mostrar:
+
+~~~text
+Bike Availability = 92%
+~~~
+
+sin modificar la fórmula.
+
+## Patrón mental
+
+~~~text
+modelo
++
+relaciones
++
+filtros
+=
+contexto
+
+contexto
++
+medida DAX
+=
+resultado
+~~~
+
+---
+
+# 64. Bike Availability % y por qué no uso AVG del porcentaje Gold
+
+Mi medida:
+
+~~~DAX
+Bike Availability % =
+DIVIDE(
+    SUM('gold_fact_bicing_availability'[free_bikes]),
+    SUM('gold_fact_bicing_availability'[station_capacity]),
+    0
+)
+~~~
+
+No hago:
+
+~~~DAX
+AVERAGE(
+    'gold_fact_bicing_availability'[bike_availability_pct]
+)
+~~~
+
+porque las estaciones pueden tener capacidades diferentes.
+
+## Ejemplo
+
+~~~text
+Station A
+1 bike / 2 capacity
+= 50%
+
+Station B
+90 bikes / 100 capacity
+= 90%
+~~~
+
+Media simple:
+
+~~~text
+(50 + 90) / 2
+= 70%
+~~~
+
+Ratio ponderado:
+
+~~~text
+91 bikes / 102 capacity
+≈ 89.2%
+~~~
+
+Para un KPI global de red, el ratio de sumas representa mejor el peso real de cada estación.
+
+## Regla mental
+
+~~~text
+row-level KPI
+→ Gold
+
+dynamic aggregated KPI
+→ DAX
+~~~
+
+---
+
+# 65. DIVIDE en DAX
+
+También usé:
+
+~~~DAX
+Dock Availability % =
+DIVIDE(
+    SUM('gold_fact_bicing_availability'[empty_slots]),
+    SUM('gold_fact_bicing_availability'[station_capacity]),
+    0
+)
+~~~
+
+y:
+
+~~~DAX
+E-bike Share % =
+DIVIDE(
+    SUM('gold_fact_bicing_availability'[ebikes]),
+    SUM('gold_fact_bicing_availability'[free_bikes]),
+    0
+)
+~~~
+
+`DIVIDE()` es preferible a escribir directamente:
+
+~~~DAX
+SUM(x) / SUM(y)
+~~~
+
+porque permite controlar el caso de denominador cero.
+
+El tercer parámetro:
+
+~~~text
+0
+~~~
+
+es el resultado alternativo.
+
+---
+
+# 66. CALCULATE y observaciones online
+
+Medida:
+
+~~~DAX
+Online Observations =
+CALCULATE(
+    COUNTROWS('gold_fact_bicing_availability'),
+    'gold_fact_bicing_availability'[is_online] = TRUE()
+)
+~~~
+
+`CALCULATE` evalúa una expresión bajo un contexto de filtro modificado.
+
+Aquí digo:
+
+~~~text
+cuenta filas
+PERO
+solo donde is_online = true
+~~~
+
+Después:
+
+~~~DAX
+Online Observation % =
+DIVIDE(
+    [Online Observations],
+    [Total Observations],
+    0
+)
+~~~
+
+Esto reutiliza medidas ya definidas.
+
+## Idea importante
+
+Una medida puede usar otras medidas.
+
+No tengo que repetir siempre toda la fórmula base.
+
+---
+
+# 67. Visuales del dashboard
+
+La página final es:
+
+~~~text
+Bicing Network Overview
+~~~
+
+Incluye:
+
+~~~text
+4 KPI cards
+3 slicers
+Azure Maps
+line chart
+station ranking
+~~~
+
+## Cards
+
+~~~text
+Bike Availability
+Dock Availability
+E-bike Share
+Online Observations
+~~~
+
+Las cards muestran el valor resultante del filter context actual.
+
+## Slicers
+
+~~~text
+Date
+Day period
+Station
+~~~
+
+El slicer de Station funciona mejor como dropdown con búsqueda porque hay cientos de estaciones.
+
+---
+
+# 68. Azure Maps y por qué usa dimensión + fact
+
+El mapa usa:
+
+~~~text
+gold_dim_station[latitude]
+gold_dim_station[longitude]
+gold_dim_station[station_name]
+~~~
+
+pero los KPIs del tooltip y el tamaño/contexto vienen de medidas sobre la fact.
+
+Conceptualmente:
+
+~~~text
+dim_station
+coordinates
+      |
+      | station_key
+      v
+fact
+      |
+      v
+DAX measures
+~~~
+
+Eso demuestra por qué una dimensión puede aportar atributos descriptivos mientras la fact aporta medidas.
+
+---
+
+# 69. Evolución temporal
+
+El line chart usa:
+
+~~~text
+X-axis
+→ snapshot_ingested_at
+
+Values
+→ Bike Availability %
+→ Dock Availability %
+~~~
+
+No uso Date hierarchy porque necesito conservar cada snapshot dentro del mismo día.
+
+Quiero puntos como:
+
+~~~text
+13:43
+14:34
+15:39
+15:59
+~~~
+
+y no solo:
+
+~~~text
+2026
+Q4
+October
+Day 3
+~~~
+
+Cada punto recalcula los KPIs para las observaciones de ese snapshot.
+
+---
+
+# 70. Ranking de estaciones y Top N
+
+El gráfico de barras muestra estaciones con baja disponibilidad.
+
+Configuré un Bottom N sobre:
+
+~~~text
+station_name
+by Bike Availability %
+~~~
+
+Observé que Power BI puede mostrar más de N barras si existen empates en el valor de corte.
+
+Ejemplo:
+
+~~~text
+posición 10 → 4.55%
+posición 11 → 4.55%
+posición 12 → 4.55%
+~~~
+
+Puede incluir todas las estaciones empatadas.
+
+Podría resolverlo con una medida de ranking y desempate, pero para este dashboard no merece aumentar la complejidad solo por limitar visualmente a exactamente 10 barras.
+
+La decisión práctica fue aceptar los empates.
+
+---
+
+# 71. El dashboard como prueba del star schema
+
+Cuando selecciono una estación:
+
+~~~text
+slicer station
+↓
+dim_station
+↓
+station_key
+↓
+fact
+↓
+DAX
+↓
+cards + map + line chart + ranking
+~~~
+
+Todo cambia a la vez.
+
+Eso valida visualmente que:
+
+~~~text
+relaciones
++
+filter context
++
+medidas
+~~~
+
+están funcionando.
+
+No es solo diseño de dashboard.
+
+También es una validación de mi modelo semántico.
+
+---
+
+# 72. PBIX live-connected
+
+Descargué:
+
+~~~text
+Bicing Network Overview.pbix
+~~~
+
+El archivo conserva el report y su definición, pero está conectado en vivo al semantic model de Fabric.
+
+Eso significa:
+
+~~~text
+PBIX
+✓ report
+✓ layouts
+✓ visuales
+✓ configuración
+
+PBIX
+✗ no contiene los datos Direct Lake
+~~~
+
+Si el semantic model deja de existir, el PBIX deja de poder recuperar esos datos.
+
+Por eso en GitHub también guardo:
+
+~~~text
+GIF
+screenshots
+~~~
+
+como evidencia visual permanente.
+
+---
+
+# 73. GIF como demo de portfolio
+
+Guardé:
+
+~~~text
+assets/demos/project-barcelona.gif
+~~~
+
+y lo muestro directamente en el README principal.
+
+Eso permite que un recruiter vea de primer vistazo:
+
+~~~text
+dashboard
+interacciones
+mapa
+slicers
+KPIs
+ranking
+~~~
+
+sin necesitar Power BI ni acceso a Fabric.
+
+El GIF no sustituye al código.
+
+Es una demo visual del resultado final.
+
+---
+
+# 74. Orquestación final Bronze → Silver → Gold
+
+Al final conecté Gold después de Silver.
+
+La secuencia final es:
+
+~~~text
+cp_ingest_bicing_bronze
+        |
+        | Success
+        v
+historical Silver notebook
+        |
+        | Success
+        v
+nb_gold_bicing_analytics
+~~~
+
+## Por qué la dependencia es Success
+
+No quiero construir Gold sobre una Silver fallida o incompleta.
+
+Así que:
+
+~~~text
+Copy falla
+→ Silver no debe ejecutarse
+
+Silver falla
+→ Gold no debe ejecutarse
+~~~
+
+Esto mantiene la cadena consistente.
+
+## Gold con overwrite
+
+Cada vez que Silver termina correctamente:
+
+~~~text
+Silver histórica actualizada
+↓
+Gold se reconstruye
+↓
+tablas Gold consistentes
+~~~
+
+Para el tamaño actual del proyecto es una estrategia adecuada.
+
+---
+
+# 75. Estado técnico final del proyecto
+
+La parte técnica completa queda:
+
+~~~text
+Public APIs
+↓
+Fabric Data Factory
+↓
+Bronze immutable history
+↓
+PySpark
+↓
+Silver Delta
+↓
+watermark
+↓
+incremental processing
+↓
+Delta MERGE
+↓
+Gold star schema
+↓
+quality checks
+↓
+SQL Analytics Endpoint
+↓
+Power BI semantic model
+↓
+DAX
+↓
+interactive dashboard
+~~~
+
+Y la orquestación principal:
+
+~~~text
+Bronze
+↓ success
+Silver
+↓ success
+Gold
+~~~
+
+Lo que queda ya no es construir la plataforma.
+
+Lo que queda es presentarla mejor:
+
+~~~text
+architecture diagrams
+documentation polish
+portfolio presentation
+~~~
+
+## Resumen final para entrevista
+
+> I built an end-to-end mobility data platform in Microsoft Fabric. REST data is ingested into immutable Bronze snapshots, Silver is processed incrementally with a watermark and idempotent Delta MERGE, and Gold is rebuilt as a validated star schema. I expose Gold through the SQL Analytics Endpoint and also consume the dimensional model directly in Power BI using one-to-many relationships and DAX measures. The final Fabric pipeline orchestrates Bronze, historical Silver and Gold with success dependencies, and the dashboard provides interactive station, temporal and network-level analysis.
